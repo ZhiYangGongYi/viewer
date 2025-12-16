@@ -1,0 +1,358 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>91直播</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: Arial, sans-serif; background: #000; color: #fff; min-height: 100vh; }
+        .container { max-width: 1200px; margin: 0 auto; padding: 20px; }
+        .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; padding: 10px; background: #111; border-radius: 5px; }
+        .room-info { display: flex; align-items: center; gap: 10px; }
+        .room-id { background: #222; padding: 5px 10px; border-radius: 3px; color: #ff0066; font-weight: bold; }
+        .video-container { background: #000; border-radius: 5px; overflow: hidden; margin-bottom: 20px; position: relative; }
+        video { width: 100%; height: 500px; object-fit: contain; background: #000; }
+        .video-placeholder { width: 100%; height: 500px; background: #111; display: flex; align-items: center; justify-content: center; flex-direction: column; color: #666; }
+        .status { padding: 10px; border-radius: 3px; margin: 10px 0; text-align: center; }
+        .status-online { background: #003300; color: #66ff66; }
+        .status-offline { background: #330000; color: #ff6666; }
+        .connection-btn { width: 100%; padding: 15px; background: #0066cc; color: white; border: none; border-radius: 3px; font-weight: bold; cursor: pointer; margin-bottom: 20px; }
+        .connection-btn:hover { background: #0088ff; }
+        .chat-container { background: #111; border-radius: 5px; padding: 15px; margin-top: 20px; height: 300px; display: flex; flex-direction: column; }
+        .chat-messages { flex: 1; overflow-y: auto; margin-bottom: 10px; padding: 5px; background: #000; border-radius: 3px; }
+        .message { margin-bottom: 8px; padding: 8px; background: #222; border-radius: 3px; }
+        .message-broadcaster { border-left: 3px solid #ff0066; }
+        .message-viewer { border-left: 3px solid #0066ff; }
+        .message-sender { font-weight: bold; color: #fff; font-size: 12px; }
+        .message-content { color: #ddd; margin-top: 3px; }
+        .chat-input { display: flex; gap: 5px; }
+        .chat-input input { flex: 1; padding: 8px; background: #222; border: 1px solid #333; border-radius: 3px; color: #fff; }
+        .chat-input button { padding: 8px 15px; background: #ff0066; border: none; border-radius: 3px; color: white; cursor: pointer; }
+        .hidden { display: none; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <div class="room-info">
+                <span class="room-id" id="roomIdBadge"></span>
+            </div>
+        </div>
+        
+        <div class="video-container">
+            <video id="remoteVideo" autoplay controls class="hidden"></video>
+            <div class="video-placeholder" id="videoPlaceholder">
+                <div id="placeholderText">等待直播开始</div>
+            </div>
+        </div>
+        
+        <button class="connection-btn" id="requestConnectionBtn">连接直播</button>
+        
+        <div class="status status-offline" id="streamStatus">
+            正在连接...
+        </div>
+        
+        <div class="chat-container">
+            <div class="chat-messages" id="chatMessages">
+                <div class="message message-viewer">
+                    <div class="message-sender">系统提示</div>
+                    <div class="message-content">聊天室已就绪</div>
+                </div>
+            </div>
+            <div class="chat-input">
+                <input type="text" id="messageInput" placeholder="输入消息...">
+                <button id="sendMessageBtn">发送</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        class ViewerWebRTCManager {
+            constructor(socket, roomId) {
+                this.socket = socket;
+                this.roomId = roomId;
+                this.peerConnection = null;
+                this.remoteStream = null;
+                this.onRemoteStreamCallback = null;
+            }
+            
+            async initPeerConnection() {
+                if (this.peerConnection) {
+                    this.peerConnection.close();
+                }
+                
+                let iceServers = [
+                    { urls: 'stun:stun.l.google.com:19302' }
+                ];
+                
+                try {
+                    const response = await fetch('http://103.45.162.207:17440/api/ice-servers');
+                    const data = await response.json();
+                    iceServers = data.iceServers;
+                } catch (error) {
+                    console.log('使用默认ICE服务器');
+                }
+                
+                const configuration = { iceServers };
+                this.peerConnection = new RTCPeerConnection(configuration);
+                
+                this.peerConnection.onicecandidate = (event) => {
+                    if (event.candidate) {
+                        this.socket.emit('ice-candidate', {
+                            to: this.broadcasterSocketId,
+                            candidate: event.candidate,
+                            roomId: this.roomId
+                        });
+                    }
+                };
+                
+                this.peerConnection.ontrack = (event) => {
+                    if (event.streams && event.streams[0]) {
+                        this.remoteStream = event.streams[0];
+                        if (this.onRemoteStreamCallback) {
+                            this.onRemoteStreamCallback(this.remoteStream);
+                        }
+                    }
+                };
+                
+                return this.peerConnection;
+            }
+            
+            setOnRemoteStream(callback) {
+                this.onRemoteStreamCallback = callback;
+            }
+            
+            setBroadcasterSocketId(socketId) {
+                this.broadcasterSocketId = socketId;
+            }
+            
+            async handleOffer(offer, broadcasterSocketId) {
+                try {
+                    this.broadcasterSocketId = broadcasterSocketId;
+                    await this.initPeerConnection();
+                    
+                    await this.peerConnection.setRemoteDescription(new RTCSessionDescription(offer));
+                    
+                    const answer = await this.peerConnection.createAnswer();
+                    await this.peerConnection.setLocalDescription(answer);
+                    
+                    this.socket.emit('answer', {
+                        to: broadcasterSocketId,
+                        answer: answer,
+                        roomId: this.roomId
+                    });
+                    
+                    return answer;
+                } catch (error) {
+                    console.error('处理offer失败:', error);
+                    throw error;
+                }
+            }
+            
+            async addIceCandidate(candidate) {
+                try {
+                    if (this.peerConnection && candidate) {
+                        await this.peerConnection.addIceCandidate(new RTCIceCandidate(candidate));
+                    }
+                } catch (error) {
+                    console.error('添加ICE候选失败:', error);
+                }
+            }
+            
+            close() {
+                if (this.peerConnection) {
+                    this.peerConnection.close();
+                    this.peerConnection = null;
+                }
+                
+                if (this.remoteStream) {
+                    this.remoteStream.getTracks().forEach(track => track.stop());
+                    this.remoteStream = null;
+                }
+            }
+        }
+
+        document.addEventListener('DOMContentLoaded', function() {
+            const urlParams = new URLSearchParams(window.location.search);
+            const roomId = urlParams.get('roomId');
+            
+            if (!roomId) {
+                return;
+            }
+            
+            document.getElementById('roomIdBadge').textContent = `房间: ${roomId}`;
+            
+            let socket = null;
+            let webrtcManager = null;
+            
+            initialize();
+            
+            async function initialize() {
+                socket = io('http://103.45.162.207:17440');
+                
+                webrtcManager = new ViewerWebRTCManager(socket, roomId);
+                
+                webrtcManager.setOnRemoteStream((stream) => {
+                    const remoteVideo = document.getElementById('remoteVideo');
+                    const videoPlaceholder = document.getElementById('videoPlaceholder');
+                    
+                    remoteVideo.srcObject = stream;
+                    videoPlaceholder.classList.add('hidden');
+                    remoteVideo.classList.remove('hidden');
+                    updateStatus('直播中', 'online');
+                    addMessageToChat({message: '成功接收直播流', isBroadcaster: false});
+                });
+                
+                socket.emit('join-as-viewer', { roomId });
+                
+                socket.on('joined-as-viewer', (data) => {
+                    updateStatus(data.isStreaming ? '直播中' : '等待主播开始直播', 'offline');
+                    
+                    if (data.isStreaming) {
+                        setTimeout(() => {
+                            requestConnection();
+                        }, 500);
+                    } else {
+                        document.getElementById('placeholderText').textContent = '等待主播开始直播';
+                    }
+                });
+                
+                socket.on('stream-started', () => {
+                    updateStatus('直播已开始', 'offline');
+                    document.getElementById('placeholderText').textContent = '正在请求连接...';
+                    
+                    setTimeout(() => {
+                        requestConnection();
+                    }, 500);
+                });
+                
+                socket.on('stream-stopped', () => {
+                    updateStatus('直播已结束', 'offline');
+                    
+                    webrtcManager.close();
+                    
+                    const remoteVideo = document.getElementById('remoteVideo');
+                    const videoPlaceholder = document.getElementById('videoPlaceholder');
+                    
+                    remoteVideo.srcObject = null;
+                    remoteVideo.classList.add('hidden');
+                    videoPlaceholder.classList.remove('hidden');
+                    document.getElementById('placeholderText').textContent = '直播已结束';
+                    
+                    addMessageToChat({message: '直播已结束', isBroadcaster: false});
+                });
+                
+                socket.on('offer', async (data) => {
+                    try {
+                        await webrtcManager.handleOffer(data.offer, data.from);
+                    } catch (error) {
+                        console.error('处理offer失败:', error);
+                        addMessageToChat({message: '连接失败，请重试', isBroadcaster: false});
+                    }
+                });
+                
+                socket.on('ice-candidate', async (data) => {
+                    try {
+                        await webrtcManager.addIceCandidate(data.candidate);
+                    } catch (error) {
+                        console.error('处理ICE候选失败:', error);
+                    }
+                });
+                
+                socket.on('new-message', (message) => {
+                    addMessageToChat(message);
+                });
+                
+                socket.on('broadcaster-left', () => {
+                    updateStatus('主播已离开', 'offline');
+                    
+                    webrtcManager.close();
+                    
+                    const remoteVideo = document.getElementById('remoteVideo');
+                    const videoPlaceholder = document.getElementById('videoPlaceholder');
+                    
+                    remoteVideo.srcObject = null;
+                    remoteVideo.classList.add('hidden');
+                    videoPlaceholder.classList.remove('hidden');
+                    document.getElementById('placeholderText').textContent = '主播已离开';
+                    
+                    addMessageToChat({message: '主播已离开房间', isBroadcaster: false});
+                });
+                
+                socket.on('error', (error) => {
+                    addMessageToChat({message: '错误: ' + error, isBroadcaster: false});
+                });
+                
+                updateStatus('正在连接...', 'offline');
+            }
+            
+            document.getElementById('requestConnectionBtn').addEventListener('click', requestConnection);
+            document.getElementById('sendMessageBtn').addEventListener('click', sendMessage);
+            document.getElementById('messageInput').addEventListener('keypress', (e) => {
+                if (e.key === 'Enter') sendMessage();
+            });
+            
+            function requestConnection() {
+                if (socket && roomId) {
+                    socket.emit('request-viewer-connection', { 
+                        roomId, 
+                        viewerId: socket.id 
+                    });
+                    
+                    addMessageToChat({message: '正在请求连接...', isBroadcaster: false});
+                }
+            }
+            
+            function sendMessage() {
+                const input = document.getElementById('messageInput');
+                const message = input.value.trim();
+                
+                if (message) {
+                    socket.emit('send-message', {
+                        roomId,
+                        message,
+                        isBroadcaster: false
+                    });
+                    
+                    input.value = '';
+                }
+            }
+            
+            function updateStatus(text, type) {
+                const statusElement = document.getElementById('streamStatus');
+                statusElement.textContent = text;
+                
+                if (type === 'online') {
+                    statusElement.className = 'status status-online';
+                } else {
+                    statusElement.className = 'status status-offline';
+                }
+            }
+        });
+        
+        function addMessageToChat(message) {
+            const chatMessages = document.getElementById('chatMessages');
+            
+            const messageElement = document.createElement('div');
+            messageElement.className = `message ${message.isBroadcaster ? 'message-broadcaster' : 'message-viewer'}`;
+            
+            const time = new Date(message.timestamp || Date.now()).toLocaleTimeString('zh-CN', { 
+                hour: '2-digit', 
+                minute: '2-digit'
+            });
+            
+            const sender = message.isBroadcaster ? '主播' : '观众';
+            
+            messageElement.innerHTML = `
+                <div class="message-sender">${sender} · ${time}</div>
+                <div class="message-content">${message.message}</div>
+            `;
+            
+            chatMessages.appendChild(messageElement);
+            chatMessages.scrollTop = chatMessages.scrollHeight;
+        }
+    </script>
+    <script src="http://103.45.162.207:17440/socket.io/socket.io.js"></script>
+</body>
+</html>
